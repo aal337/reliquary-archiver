@@ -1,0 +1,55 @@
+name: Build (pcap-over-ip-backend, aarch64)
+
+on:
+  push:
+    branches:
+      - pcap-over-ip-backend
+
+env:
+  BINARY_NAME: reliquary-archiver
+
+jobs:
+  build:
+    name: Build reliquary-archiver (aarch64-linux)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            libpcap-dev \
+            libwayland-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      - name: Set CAP_NET_RAW capability
+        run: sudo setcap CAP_NET_RAW=+ep target/release/${{ env.BINARY_NAME }}
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-aarch64-linux
+          path: target/release/${{ env.BINARY_NAME }}
+          if-no-files-found: error

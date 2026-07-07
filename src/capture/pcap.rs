@@ -67,74 +67,86 @@ impl PacketCapture for PcapCapture {
 
                     tracing::info!(%addr, "waiting for PCAPdroid connection");
 
-                    let (mut stream, peer) = listener.accept().await?;
-
-                    tracing::info!(%peer, "PCAPdroid connected");
-
-                    // PCAP global header
-                    let mut global = [0u8; 24];
-                    stream.read_exact(&mut global).await?;
-
-                    let magic = u32::from_le_bytes(global[0..4].try_into()?);
-
-                    let little_endian = match magic {
-                        0xa1b2c3d4 | 0xa1b23c4d => true,
-                        0xd4c3b2a1 | 0x4d3cb2a1 => false,
-                        _ => return Err("invalid pcap magic".into()),
-                    };
-
-                    let linktype = ::pcap::Linktype(
-                        if little_endian {
-                            u32::from_le_bytes(global[20..24].try_into()?)
-                        } else {
-                            u32::from_be_bytes(global[20..24].try_into()?)
-                        } as i32
-                    );
-
                     loop {
-                        let mut packet_header = [0u8; 16];
-
-                        match stream.read_exact(&mut packet_header).await {
-                            Ok(_) => {}
-                            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                                break;
-                            }
-                            Err(e) => return Err(e.into()),
-                        }
-
-                        let captured_len = if little_endian {
-                            u32::from_le_bytes(packet_header[8..12].try_into()?)
-                        } else {
-                            u32::from_be_bytes(packet_header[8..12].try_into()?)
+                        let (mut stream, peer) = match listener.accept().await {
+                            Ok(pair) => pair,
+                            Err(e) => tracing::warn!(%e, "accept failed, retrying");
+                            continue;
                         };
 
-                        let mut payload = vec![0u8; captured_len as usize];
-                        stream.read_exact(&mut payload).await?;
+                        tracing::info!(%peer, "PCAPdroid connected");
 
-                        let payload = match normalize_offline_pcap_payload(
-                            linktype,
-                            &payload,
-                        ) {
-                            Ok(payload) => payload,
-                            Err(e) => {
-                                debug!(%e, "dropping packet during normalization");
+                        // PCAP global header
+                        let mut global = [0u8; 24];
+                        stream.read_exact(&mut global).await?;
+
+                        let magic = u32::from_le_bytes(global[0..4].try_into()?);
+
+                        let little_endian = match magic {
+                            0xa1b2c3d4 | 0xa1b23c4d => true,
+                            0xd4c3b2a1 | 0x4d3cb2a1 => false,
+                            _ => return Err("invalid pcap magic".into()),
+                        };
+
+                        let linktype = ::pcap::Linktype(
+                            if little_endian {
+                                u32::from_le_bytes(global[20..24].try_into()?)
+                            } else {
+                                u32::from_be_bytes(global[20..24].try_into()?)
+                            } as i32
+                        );
+
+                        loop {
+                            let mut packet_header = [0u8; 16];
+
+                            match stream.read_exact(&mut packet_header).await {
+                                Ok(_) => {}
+                                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                                    break;
+                                }
+                                Err(e) => return Err(e.into()),
+                            }
+
+                            let captured_len = if little_endian {
+                                u32::from_le_bytes(packet_header[8..12].try_into()?)
+                            } else {
+                                u32::from_be_bytes(packet_header[8..12].try_into()?)
+                            };
+
+                            let mut payload = vec![0u8; captured_len as usize];
+                            match stream.read_exact(&mut payload).await {
+                                Ok(_) => {}
+                                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                                    break;
+                                }
+                                Err(e) => return Err(e.into()),
+                            }
+
+                            let payload = match normalize_offline_pcap_payload(
+                                linktype,
+                                &payload,
+                            ) {
+                                Ok(payload) => payload,
+                                Err(e) => {
+                                    debug!(%e, "dropping packet during normalization");
+                                    continue;
+                                }
+                            };
+
+                            if !is_udp_port_packet(&payload) {
                                 continue;
                             }
-                        };
 
-                        if !is_udp_port_packet(&payload) {
-                            continue;
+                            has_captured = true;
+
+                            yield Ok(Packet {
+                                source_id,
+                                data: payload,
+                            });
                         }
 
-                        has_captured = true;
-
-                        yield Ok(Packet {
-                            source_id,
-                            data: payload,
-                        });
+                        Ok(())
                     }
-
-                    Ok(())
                 }
                 .await;
 
