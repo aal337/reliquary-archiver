@@ -1,19 +1,23 @@
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::atomic::Ordering;
+use std::net::SocketAddr;
 
-use ::pcap::{self, Active, Capture, Device as PcapDevice};
-use futures::executor::block_on;
-use futures::{SinkExt, StreamExt, TryStreamExt};
-use pcap::PacketCodec;
-use tracing::{debug, instrument, warn};
+use futures::Stream;
+use tokio::io::AsyncReadExt;
+use tokio::net::TcpStream;
+use tracing::instrument;
 
 use super::*;
 
 pub struct PcapBackend;
 
+#[derive(Debug, Clone)]
+pub struct PcapDevice {
+    addr: SocketAddr,
+    id: u64,
+}
+
 pub struct PcapCapture {
-    capture: Capture<Active>,
-    device: PcapDevice,
+    addr: SocketAddr,
     id: u64,
 }
 
@@ -21,13 +25,16 @@ impl CaptureBackend for PcapBackend {
     type Device = PcapDevice;
 
     fn list_devices(&self) -> Result<Vec<Self::Device>> {
-        Ok(PcapDevice::list()
-            .map_err(|e| CaptureError::DeviceError(Box::new(e)))?
-            .into_iter()
-            .filter(|d| matches!(d.flags.connection_status, pcap::ConnectionStatus::Connected))
-            .filter(|d| !d.addresses.is_empty())
-            .filter(|d| !d.flags.is_loopback())
-            .collect::<Vec<_>>())
+        // PCAPdroid "PCAP over IP" endpoint
+        let addr: SocketAddr = "192.168.1.100:1234".parse().unwrap();
+
+        let mut hasher = DefaultHasher::new();
+        addr.hash(&mut hasher);
+
+        Ok(vec![PcapDevice {
+            addr,
+            id: hasher.finish(),
+        }])
     }
 }
 
@@ -35,97 +42,153 @@ impl CaptureDevice for PcapDevice {
     type Capture = PcapCapture;
 
     fn name(&self) -> &str {
-        &self.name
+        "pcap-over-ip"
     }
 
     fn create_capture(&self) -> Result<Self::Capture> {
-        let mut capture = Capture::from_device(self.clone())
-            .map_err(|e| CaptureError::DeviceError(Box::new(e)))?
-            .immediate_mode(true)
-            .promisc(true)
-            .timeout(1000)
-            .buffer_size(1024 * 1024 * 16) // 16MB
-            .open()
-            .map_err(|e| CaptureError::CaptureError {
-                has_captured: false,
-                error: Box::new(e),
-            })?;
-
-        let mut capture = capture.setnonblock().map_err(|e| CaptureError::CaptureError {
-            has_captured: false,
-            error: Box::new(e),
-        })?;
-
-        capture
-            .filter(PCAP_FILTER, true)
-            .map_err(|e| CaptureError::FilterError(Box::new(e)))?;
-
-        let mut hasher = DefaultHasher::new();
-        self.name.hash(&mut hasher);
-        let id = hasher.finish();
-
         Ok(PcapCapture {
-            capture,
-            device: self.clone(),
-            id,
+            addr: self.addr,
+            id: self.id,
         })
     }
 }
 
-pub struct Codec {
-    source_id: u64,
-}
-
-impl PacketCodec for Codec {
-    type Item = Packet;
-
-    fn decode(&mut self, pkt: pcap::Packet) -> Self::Item {
-        Packet {
-            source_id: self.source_id,
-            data: pkt.data.to_vec(),
-        }
-    }
-}
-
 impl PacketCapture for PcapCapture {
-    #[instrument(skip_all, fields(device = self.device.desc))]
-    fn capture_packets(mut self) -> Result<impl Stream<Item = Result<Packet>>> {
-        let mut has_captured = false;
+    #[instrument(skip_all)]
+    fn capture_packets(self) -> Result<impl Stream<Item = Result<Packet>> + Unpin + Send> {
+        let addr = self.addr;
+        let source_id = self.id;
 
-        return match self.capture.stream(Codec { source_id: self.id }) {
-            Ok(stream) => Ok(Box::pin(
-                stream
-                    .take_while(move |r| {
-                        let result = match &r {
-                            Err(pcap::Error::PcapError(error_msg)) => {
-                                // Check if this is a device removal error
-                                if error_msg.contains("ERROR_DEVICE_REMOVED") {
-                                    warn!(%error_msg, %self.device.name, "Device removed, terminating capture stream");
-                                    false // Stop the stream immediately
-                                } else {
-                                    true // Continue for other errors
-                                }
+        Ok(Box::pin(async_stream::stream! {
+            let mut has_captured = false;
+
+            let result: std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> =
+                async {
+                    let mut stream = TcpStream::connect(addr).await?;
+
+                    // Read PCAP global header
+                    let mut global = [0u8; 24];
+                    stream.read_exact(&mut global).await?;
+
+                    let magic = u32::from_le_bytes(global[0..4].try_into()?);
+
+                    let little_endian = match magic {
+                        0xa1b2c3d4 | 0xa1b23c4d => true,
+                        0xd4c3b2a1 | 0x4d3cb2a1 => false,
+                        _ => return Err("invalid pcap magic".into()),
+                    };
+
+                    let network = if little_endian {
+                        u32::from_le_bytes(global[20..24].try_into()?)
+                    } else {
+                        u32::from_be_bytes(global[20..24].try_into()?)
+                    };
+
+                    let linktype = ::pcap::Linktype(network as i32);
+
+                    loop {
+                        let mut packet_header = [0u8; 16];
+
+                        match stream.read_exact(&mut packet_header).await {
+                            Ok(_) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                                break;
                             }
-                            _ => true, // Continue for Ok packets
+                            Err(e) => return Err(e.into()),
+                        }
+
+                        let captured_length = if little_endian {
+                            u32::from_le_bytes(packet_header[8..12].try_into()?)
+                        } else {
+                            u32::from_be_bytes(packet_header[8..12].try_into()?)
                         };
 
-                        async move { result }
-                    })
-                    .map(move |r| match r {
-                        Ok(p) => {
-                            has_captured = true;
-                            Ok(p)
+                        let mut payload = vec![0u8; captured_length as usize];
+                        stream.read_exact(&mut payload).await?;
+
+                        let payload = match normalize_offline_pcap_payload(
+                            linktype,
+                            &payload,
+                        ) {
+                            Ok(payload) => payload,
+                            Err(e) => {
+                                debug!(%e, "dropping unsupported packet");
+                                continue;
+                            }
+                        };
+
+                        if !is_udp_port_packet(&payload) {
+                            continue;
                         }
-                        Err(e) => Err(CaptureError::CaptureError {
-                            has_captured,
-                            error: Box::new(e),
-                        }),
-                    }),
-            )),
-            Err(e) => Err(CaptureError::CaptureError {
-                has_captured: false,
-                error: Box::new(e),
-            }),
-        };
+
+                        has_captured = true;
+
+                        yield Ok(Packet {
+                            source_id,
+                            data: payload,
+                        });
+                    }
+
+                    Ok(())
+                }
+                .await;
+
+            if let Err(e) = result {
+                yield Err(CaptureError::CaptureError {
+                    has_captured,
+                    error: e,
+                });
+            }
+        }))
     }
+}
+
+fn is_udp_port_packet(frame: &[u8]) -> bool {
+    if frame.len() < 14 {
+        return false;
+    }
+
+    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+    let ip_offset = 14;
+
+    match ethertype {
+        0x0800 => {
+            if frame.len() < ip_offset + 20 {
+                return false;
+            }
+
+            if frame[ip_offset + 9] != 17 {
+                return false;
+            }
+
+            let header_len = (frame[ip_offset] & 0x0f) as usize * 4;
+            udp_ports_match(frame, ip_offset + header_len)
+        }
+
+        0x86dd => {
+            if frame.len() < ip_offset + 40 {
+                return false;
+            }
+
+            if frame[ip_offset + 6] != 17 {
+                return false;
+            }
+
+            udp_ports_match(frame, ip_offset + 40)
+        }
+
+        _ => false,
+    }
+}
+
+fn udp_ports_match(frame: &[u8], offset: usize) -> bool {
+    if frame.len() < offset + 4 {
+        return false;
+    }
+
+    let src = u16::from_be_bytes([frame[offset], frame[offset + 1]]);
+    let dst = u16::from_be_bytes([frame[offset + 2], frame[offset + 3]]);
+
+    (23301..=23302).contains(&src)
+        || (23301..=23302).contains(&dst)
 }
