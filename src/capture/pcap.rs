@@ -25,11 +25,10 @@ impl CaptureBackend for PcapBackend {
     type Device = PcapDevice;
 
     fn list_devices(&self) -> Result<Vec<Self::Device>> {
-        // PCAPdroid "PCAP over IP" endpoint
-        let addr: SocketAddr = "192.168.1.100:1234".parse().unwrap();
+        let addr: SocketAddr = "0.0.0.0:1234".parse().unwrap();
 
         let mut hasher = DefaultHasher::new();
-        addr.hash(&mut hasher);
+        "pcap-over-ip".hash(&mut hasher);
 
         Ok(vec![PcapDevice {
             addr,
@@ -64,9 +63,15 @@ impl PacketCapture for PcapCapture {
 
             let result: std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> =
                 async {
-                    let mut stream = TcpStream::connect(addr).await?;
+                    let listener = tokio::net::TcpListener::bind(addr).await?;
 
-                    // Read PCAP global header
+                    tracing::info!(%addr, "waiting for PCAPdroid connection");
+
+                    let (mut stream, peer) = listener.accept().await?;
+
+                    tracing::info!(%peer, "PCAPdroid connected");
+
+                    // PCAP global header
                     let mut global = [0u8; 24];
                     stream.read_exact(&mut global).await?;
 
@@ -78,13 +83,13 @@ impl PacketCapture for PcapCapture {
                         _ => return Err("invalid pcap magic".into()),
                     };
 
-                    let network = if little_endian {
-                        u32::from_le_bytes(global[20..24].try_into()?)
-                    } else {
-                        u32::from_be_bytes(global[20..24].try_into()?)
-                    };
-
-                    let linktype = ::pcap::Linktype(network as i32);
+                    let linktype = ::pcap::Linktype(
+                        if little_endian {
+                            u32::from_le_bytes(global[20..24].try_into()?)
+                        } else {
+                            u32::from_be_bytes(global[20..24].try_into()?)
+                        } as i32
+                    );
 
                     loop {
                         let mut packet_header = [0u8; 16];
@@ -97,13 +102,13 @@ impl PacketCapture for PcapCapture {
                             Err(e) => return Err(e.into()),
                         }
 
-                        let captured_length = if little_endian {
+                        let captured_len = if little_endian {
                             u32::from_le_bytes(packet_header[8..12].try_into()?)
                         } else {
                             u32::from_be_bytes(packet_header[8..12].try_into()?)
                         };
 
-                        let mut payload = vec![0u8; captured_length as usize];
+                        let mut payload = vec![0u8; captured_len as usize];
                         stream.read_exact(&mut payload).await?;
 
                         let payload = match normalize_offline_pcap_payload(
@@ -112,7 +117,7 @@ impl PacketCapture for PcapCapture {
                         ) {
                             Ok(payload) => payload,
                             Err(e) => {
-                                debug!(%e, "dropping unsupported packet");
+                                debug!(%e, "dropping packet during normalization");
                                 continue;
                             }
                         };
