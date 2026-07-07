@@ -103,7 +103,7 @@ pub async fn start_websocket_server(
                 },
             };
 
-            let server_addr = format!("0.0.0.0:{}", port);
+            let server_addr = "127.0.0.1:9000";
 
             let service = Router::new()
                 .route("/ws", get(ws_handler))
