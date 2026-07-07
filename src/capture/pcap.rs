@@ -57,104 +57,130 @@ impl PacketCapture for PcapCapture {
     fn capture_packets(self) -> Result<impl Stream<Item = Result<Packet>> + Unpin + Send> {
         let addr = self.addr;
         let source_id = self.id;
-
+ 
         Ok(Box::pin(async_stream::stream! {
             let mut has_captured = false;
-
-            let result: std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> =
-                async {
-                    let listener = tokio::net::TcpListener::bind(addr).await?;
-
-                    tracing::info!(%addr, "waiting for PCAPdroid connection");
-
-                    loop {
-                        let (mut stream, peer) = match listener.accept().await {
-                            Ok(pair) => pair,
-                            Err(e) => {tracing::warn!(%e, "accept failed, retrying");
-                            continue;}
-                        };
-
-                        tracing::info!(%peer, "PCAPdroid connected");
-
-                        // PCAP global header
-                        let mut global = [0u8; 24];
-                        stream.read_exact(&mut global).await?;
-
-                        let magic = u32::from_le_bytes(global[0..4].try_into()?);
-
-                        let little_endian = match magic {
-                            0xa1b2c3d4 | 0xa1b23c4d => true,
-                            0xd4c3b2a1 | 0x4d3cb2a1 => false,
-                            _ => return Err("invalid pcap magic".into()),
-                        };
-
-                        let linktype = ::pcap::Linktype(
-                            if little_endian {
-                                u32::from_le_bytes(global[20..24].try_into()?)
-                            } else {
-                                u32::from_be_bytes(global[20..24].try_into()?)
-                            } as i32
-                        );
-
-                        loop {
-                            let mut packet_header = [0u8; 16];
-
-                            match stream.read_exact(&mut packet_header).await {
-                                Ok(_) => {}
-                                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                                    break;
-                                }
-                                Err(e) => return Err(e.into()),
-                            }
-
-                            let captured_len = if little_endian {
-                                u32::from_le_bytes(packet_header[8..12].try_into()?)
-                            } else {
-                                u32::from_be_bytes(packet_header[8..12].try_into()?)
-                            };
-
-                            let mut payload = vec![0u8; captured_len as usize];
-                            match stream.read_exact(&mut payload).await {
-                                Ok(_) => {}
-                                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                                    break;
-                                }
-                                Err(e) => return Err(e.into()),
-                            }
-
-                            let payload = match normalize_offline_pcap_payload(
-                                linktype,
-                                &payload,
-                            ) {
-                                Ok(payload) => payload,
-                                Err(e) => {
-                                    debug!(%e, "dropping packet during normalization");
-                                    continue;
-                                }
-                            };
-
-                            if !is_udp_port_packet(&payload) {
-                                continue;
-                            }
-
-                            has_captured = true;
-
-                            yield Ok(Packet {
-                                source_id,
-                                data: payload,
-                            });
-                        }
-
-                        Ok(())
-                    }
+ 
+            // NOTE: intentionally NOT wrapped in a nested `async {}` block.
+            // async_stream's `yield` rewriting does not recurse into nested
+            // async blocks/closures, so any `yield` inside one is left as
+            // literal (unstable) generator syntax and fails to compile.
+            // Errors are propagated by yielding an `Err(..)` and `return`ing
+            // instead of using `?`.
+ 
+            let listener = match tokio::net::TcpListener::bind(addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    yield Err(CaptureError::CaptureError {
+                        has_captured,
+                        error: Box::new(e),
+                    });
+                    return;
                 }
-                .await;
-
-            if let Err(e) = result {
-                yield Err(CaptureError::CaptureError {
-                    has_captured,
-                    error: e,
-                });
+            };
+ 
+            tracing::info!(%addr, "waiting for PCAPdroid connection");
+ 
+            'accept: loop {
+                let (mut stream, peer) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        tracing::warn!(%e, "accept failed, retrying");
+                        continue 'accept;
+                    }
+                };
+ 
+                tracing::info!(%peer, "PCAPdroid connected");
+ 
+                // PCAP global header
+                let mut global = [0u8; 24];
+                if let Err(e) = stream.read_exact(&mut global).await {
+                    yield Err(CaptureError::CaptureError {
+                        has_captured,
+                        error: Box::new(e),
+                    });
+                    return;
+                }
+ 
+                let magic = u32::from_le_bytes(global[0..4].try_into().unwrap());
+ 
+                let little_endian = match magic {
+                    0xa1b2c3d4 | 0xa1b23c4d => true,
+                    0xd4c3b2a1 | 0x4d3cb2a1 => false,
+                    _ => {
+                        yield Err(CaptureError::CaptureError {
+                            has_captured,
+                            error: "invalid pcap magic".into(),
+                        });
+                        return;
+                    }
+                };
+ 
+                let linktype = ::pcap::Linktype(
+                    if little_endian {
+                        u32::from_le_bytes(global[20..24].try_into().unwrap())
+                    } else {
+                        u32::from_be_bytes(global[20..24].try_into().unwrap())
+                    } as i32,
+                );
+ 
+                'packets: loop {
+                    let mut packet_header = [0u8; 16];
+ 
+                    match stream.read_exact(&mut packet_header).await {
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                            break 'packets;
+                        }
+                        Err(e) => {
+                            yield Err(CaptureError::CaptureError {
+                                has_captured,
+                                error: Box::new(e),
+                            });
+                            return;
+                        }
+                    }
+ 
+                    let captured_len = if little_endian {
+                        u32::from_le_bytes(packet_header[8..12].try_into().unwrap())
+                    } else {
+                        u32::from_be_bytes(packet_header[8..12].try_into().unwrap())
+                    };
+ 
+                    let mut payload = vec![0u8; captured_len as usize];
+                    match stream.read_exact(&mut payload).await {
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                            break 'packets;
+                        }
+                        Err(e) => {
+                            yield Err(CaptureError::CaptureError {
+                                has_captured,
+                                error: Box::new(e),
+                            });
+                            return;
+                        }
+                    }
+ 
+                    let payload = match normalize_offline_pcap_payload(linktype, &payload) {
+                        Ok(payload) => payload,
+                        Err(e) => {
+                            tracing::debug!(%e, "dropping packet during normalization");
+                            continue 'packets;
+                        }
+                    };
+ 
+                    if !is_udp_port_packet(&payload) {
+                        continue 'packets;
+                    }
+ 
+                    has_captured = true;
+ 
+                    yield Ok(Packet {
+                        source_id,
+                        data: payload,
+                    });
+                }
             }
         }))
     }
