@@ -70,8 +70,8 @@ impl PacketCapture for PcapCapture {
                     loop {
                         let (mut stream, peer) = match listener.accept().await {
                             Ok(pair) => pair,
-                            Err(e) => tracing::warn!(%e, "accept failed, retrying");
-                            continue;
+                            Err(e) => {tracing::warn!(%e, "accept failed, retrying");
+                            continue;}
                         };
 
                         tracing::info!(%peer, "PCAPdroid connected");
